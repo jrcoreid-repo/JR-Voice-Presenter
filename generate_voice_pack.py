@@ -6,6 +6,9 @@ from pathlib import Path
 from presenter import number_words
 
 PHRASES = {
+    'open': 'Opening your presentation, sir.',
+    'start': 'Presentation ready, sir.',
+    'stop': 'Presentation ended, sir.',
     'startup': 'All systems operational. Welcome back, sir.',
     'ready': 'Ready when you are, sir.',
     'next': 'Certainly, sir.',
