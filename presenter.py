@@ -24,10 +24,33 @@ def decide(result, threshold, last, now, cooldown):
         return None
     return COMMANDS[text]
 
+def select_device(sd, explicit=None, name=None):
+    devices = sd.query_devices()
+    hosts = sd.query_hostapis()
+    if explicit is not None:
+        sd.query_devices(explicit, 'input')
+        return explicit
+    candidates = [(i,d) for i,d in enumerate(devices) if d['max_input_channels'] > 0]
+    def rank(item):
+        i,d = item
+        host = hosts[d['hostapi']]['name'].lower()
+        return (0 if 'wasapi' in host else 1 if 'mme' in host else 2, i)
+    if name:
+        matches = [item for item in candidates if name.casefold() in item[1]['name'].casefold()]
+        if not matches: raise ValueError('No input device matching ' + name)
+        return min(matches, key=rank)[0]
+    matches = [item for item in candidates if 'jbl tune125bt' in item[1]['name'].lower()]
+    if matches: return min(matches, key=rank)[0]
+    default = int(sd.default.device[0])
+    sd.query_devices(default, 'input')
+    return default
+
 def main():
-    p = argparse.ArgumentParser(description='JR Voice Presenter v0.2')
+    p = argparse.ArgumentParser(description='JR Voice Presenter v0.3')
     p.add_argument('--list-devices', action='store_true')
-    p.add_argument('--device', type=int)
+    group = p.add_mutually_exclusive_group()
+    group.add_argument('--device', type=int)
+    group.add_argument('--mic', help='Input device name substring, e.g. Realtek or JBL')
     p.add_argument('--model', default=str(Path(__file__).parent / 'models' / 'vosk-model-small-en-us-0.15'))
     p.add_argument('--control', action='store_true', help='Enable PowerPoint control; default is dry run')
     p.add_argument('--grammar', action=argparse.BooleanOptionalAction, default=True, help='Constrained vocabulary (default)')
@@ -44,6 +67,12 @@ def main():
     if not Path(a.model).is_dir(): p.error('Model missing. Run setup_model.py first.')
     if not 0 <= a.confidence <= 1 or a.cooldown < 0: p.error('Invalid confidence or cooldown')
     SetLogLevel(-1)
+    try:
+        a.device = select_device(sd, a.device, a.mic)
+        info = sd.query_devices(a.device, 'input')
+        print(f"MIC SELECTED: {a.device} | {info['name']} | {sd.query_hostapis(info['hostapi'])['name']}", flush=True)
+    except (ValueError, sd.PortAudioError, IndexError) as exc:
+        p.error(f'Microphone selection failed: {exc}. Run --list-devices or omit --device.')
     rate = a.samplerate or int(sd.query_devices(a.device, 'input')['default_samplerate'])
     model = Model(a.model)
     rec = KaldiRecognizer(model, rate, json.dumps([k for k,v in COMMANDS.items() if not v.startswith('goto:') or int(v.split(':')[1]) <= a.max_slide]+['[unk]'])) if a.grammar else KaldiRecognizer(model, rate)
@@ -58,6 +87,7 @@ def main():
         try: q.put_nowait((time.monotonic(), bytes(indata)))
         except queue.Full: overflow = True
     last = float('-inf')
+    last_audio = time.monotonic()
     locked = False
     print(f'RUNNING | {sd.query_devices(a.device, "input")["name"]} | {rate} Hz | {"PPT CONTROL" if a.control else "DRY RUN"}', flush=True)
     print('Say: slide next / slide back / slide five / slide lock. Ctrl+C to stop.', flush=True)
@@ -65,7 +95,11 @@ def main():
         with sd.RawInputStream(device=a.device, samplerate=rate, channels=1, dtype='int16', blocksize=max(1,rate//20), callback=callback):
             while True:
                 try: captured, data = q.get(timeout=1)
-                except queue.Empty: continue
+                except queue.Empty:
+                    if time.monotonic() - last_audio > 3:
+                        raise SystemExit('Microphone stopped sending audio. Restart to select a fresh device.')
+                    continue
+                last_audio = time.monotonic()
                 if overflow or time.monotonic() - captured > .5:
                     overflow = False
                     rec.Reset()
@@ -111,6 +145,6 @@ def main():
                     print('EXECUTED:',result['text'],flush=True)
                 except Exception as exc: print('PPT ERROR:',exc,flush=True)
     except KeyboardInterrupt: print('\nSTOPPED')
-    except sd.PortAudioError as exc: raise SystemExit(f'Microphone error: {exc}. Check --list-devices and restart.')
+    except sd.PortAudioError as exc: raise SystemExit(f'Microphone error: {exc}. Reconnect microphone and restart; device selection will refresh.')
 
 if __name__ == '__main__': main()
