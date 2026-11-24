@@ -241,6 +241,19 @@ def init_sapi():
         print('WARN: voice feedback unavailable:', exc, flush=True)
         return None
 
+def activate_target(app, pres):
+    # Activate the document window, not an arbitrary foreground window.
+    if pres.Windows.Count == 0:
+        window = pres.NewWindow()
+    else:
+        window = pres.Windows(1)
+    try:
+        window.WindowState = 1  # ppWindowNormal
+    except Exception:
+        pass
+    window.Activate()
+    return window
+
 def open_target(client, path):
     path = path.resolve()
     if not path.is_file():
@@ -252,8 +265,11 @@ def open_target(client, path):
     app.Visible = True
     for pres in app.Presentations:
         if Path(pres.FullName).resolve() == path:
+            activate_target(app, pres)
             return app, pres
-    return app, app.Presentations.Open(str(path), WithWindow=True)
+    pres = app.Presentations.Open(str(path), WithWindow=True)
+    activate_target(app, pres)
+    return app, pres
 
 def run_lifecycle(client, path, action):
     if action in ('open', 'start'):
@@ -264,7 +280,21 @@ def run_lifecycle(client, path, action):
                     return
             if app.SlideShowWindows.Count:
                 raise RuntimeError('Another slideshow is running; stop it first')
-            pres.SlideShowSettings.Run()
+            # COM may briefly report a busy UI immediately after opening.
+            # Retry only known transient COM errors, never arbitrary failures.
+            for attempt in range(4):
+                try:
+                    activate_target(app, pres)
+                    pres.SlideShowSettings.Run()
+                    break
+                except Exception as exc:
+                    hresult = getattr(exc, 'hresult', None)
+                    if attempt == 3 or hresult not in (-2147418111, -2147417846):
+                        raise
+                    time.sleep(.25)
+                    for window in app.SlideShowWindows:
+                        if Path(window.Presentation.FullName).resolve() == path.resolve():
+                            return
         return
     app = client.GetActiveObject('PowerPoint.Application')
     for window in app.SlideShowWindows:
@@ -274,7 +304,7 @@ def run_lifecycle(client, path, action):
     raise RuntimeError('Configured presentation is not running')
 
 def main():
-    p = argparse.ArgumentParser(description='JR Voice Presenter v0.6.5 experimental')
+    p = argparse.ArgumentParser(description='JR Voice Presenter v0.6.6 experimental')
     p.add_argument('--list-devices', action='store_true')
     group = p.add_mutually_exclusive_group()
     group.add_argument('--device', type=int)
