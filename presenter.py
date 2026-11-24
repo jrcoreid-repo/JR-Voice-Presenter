@@ -48,6 +48,43 @@ def validate_phrase(result, strict=True):
         return 'missing timing'
     return None
 
+def wake_phrase(result, partial=False, armed=False):
+    """Extract only a complete command suffix after an explicit wake word."""
+    words = result.get('partial_result' if partial else 'result', [])
+    tokens = [w.get('word', '') for w in words]
+    if not tokens: return None
+    for i in range(len(tokens)-1, -1, -1):
+        size = 1 if tokens[i] == 'powerpoint' else (2 if tokens[i:i+2] == ['power', 'point'] else 0)
+        if not size: continue
+        tail = words[i+size:]
+        if not tail: return None
+        wake = dict(words[i])
+        wake['word'] = 'slide'
+        wake['end'] = words[i+size-1].get('end', 0)
+        wake['conf'] = min(w.get('conf', 0) for w in words[i:i+size])
+        normalized = [wake] + tail
+        text = ' '.join(w.get('word', '') for w in normalized)
+        return {'text': text, 'result': normalized} if text in COMMANDS else None
+    if armed and not partial:
+        first = words[0]
+        synthetic = {'word':'slide', 'start':first.get('start',0)-.3,
+                     'end':first.get('start',0), 'conf':1.0}
+        text = 'slide ' + ' '.join(tokens)
+        return {'text':text, 'result':[synthetic]+words} if text in COMMANDS else None
+    return None
+
+def wake_only(result, threshold):
+    words = result.get('result', [])
+    tokens = [w.get('word','') for w in words]
+    size = 1 if tokens[-1:] == ['powerpoint'] else (2 if tokens[-2:] == ['power','point'] else 0)
+    return bool(size and all(w.get('conf',0) >= threshold for w in words[-size:]))
+
+def wake_grammar(limit):
+    tails = [k[6:] for k,v in COMMANDS.items()
+             if not v.startswith('goto:') or int(v.split(':')[1]) <= limit]
+    return ['[unk]', 'powerpoint', 'power point'] + tails + [
+        prefix + ' ' + tail for prefix in ('powerpoint','power point') for tail in tails]
+
 def rms_dbfs(data):
     samples = array('h', data)
     if not samples: return -120.0
@@ -75,6 +112,13 @@ def self_test():
     assert decide(result,.85,-100,10,1) is None
     assert decide(sample('slide next'),.85,9.5,10,1) is None
     print('PASS: timing, confidence and cooldown guards')
+    assert wake_phrase(sample('ordinary words power point next'))['text'] == 'slide next'
+    assert wake_phrase(sample('ordinary words powerpoint twenty five'))['text'] == 'slide twenty five'
+    assert wake_phrase(sample('ordinary words next')) is None
+    assert wake_phrase(sample('power point close')) is None
+    assert wake_phrase(sample('five'), armed=True)['text'] == 'slide five'
+    assert wake_only(sample('ordinary words power point'), .85)
+    print('PASS: wake phrase suffix and separate command guards')
     print('Self-test checks synthetic results only; no audio or PowerPoint tested.')
 
 def device_candidates(sd, explicit=None, name=None, fallback=True):
@@ -106,7 +150,7 @@ class AudioLost(Exception):
     pass
 
 def main():
-    p = argparse.ArgumentParser(description='JR Voice Presenter v0.4')
+    p = argparse.ArgumentParser(description='JR Voice Presenter v0.6 experimental')
     p.add_argument('--list-devices', action='store_true')
     group = p.add_mutually_exclusive_group()
     group.add_argument('--device', type=int)
@@ -120,6 +164,8 @@ def main():
     p.add_argument('--cooldown', type=float, default=1.0)
     p.add_argument('--samplerate', type=int)
     p.add_argument('--verbose', action='store_true')
+    p.add_argument('--wake', choices=['powerpoint','legacy'], default='powerpoint')
+    p.add_argument('--final-only', action='store_true', help='Disable experimental partial-result execution')
     p.add_argument('--self-test', action='store_true', help='Run synthetic command guard tests')
     p.add_argument('--diagnostic', action='store_true', help='Show input level and rejection reasons')
     p.add_argument('--no-timing-guard', action='store_true', help='Disable experimental duration checks for A/B tests')
@@ -151,8 +197,15 @@ def main():
                 info = sd.query_devices(device, 'input')
                 rate = a.samplerate or int(info['default_samplerate'])
                 print(f"TRY MIC: {device} | {info['name']} | {sd.query_hostapis(info['hostapi'])['name']}", flush=True)
-                rec = KaldiRecognizer(model, rate, json.dumps([k for k,v in COMMANDS.items() if not v.startswith('goto:') or int(v.split(':')[1]) <= a.max_slide]+['[unk]'])) if a.grammar else KaldiRecognizer(model, rate)
+                grammar = wake_grammar(a.max_slide) if a.wake == 'powerpoint' else [k for k,v in COMMANDS.items() if not v.startswith('goto:') or int(v.split(':')[1]) <= a.max_slide]+['[unk]']
+                rec = KaldiRecognizer(model, rate, json.dumps(grammar)) if a.grammar else KaldiRecognizer(model, rate)
                 rec.SetWords(True)
+                partial_enabled = a.wake == 'powerpoint' and not a.final_only and hasattr(rec, 'SetPartialWords')
+                if partial_enabled: rec.SetPartialWords(True)
+                armed_until = 0.0
+                pending = None
+                pending_since = 0.0
+                consumed = False
                 q = queue.Queue(maxsize=40)
                 overflow = False
                 def callback(indata, frames, timing, status):
@@ -161,7 +214,7 @@ def main():
                     try: q.put_nowait((time.monotonic(), bytes(indata)))
                     except queue.Full: overflow = True
                 last_audio = time.monotonic()
-                print('Say: slide next / slide back / slide five / slide lock. Ctrl+C to stop.', flush=True)
+                print('Say: PowerPoint next / back / five. Ctrl+C to stop.' if a.wake == 'powerpoint' else 'Say: slide next / back / five. Ctrl+C to stop.', flush=True)
                 with sd.RawInputStream(device=device, samplerate=rate, channels=1, dtype='int16', blocksize=max(1,rate//20), callback=callback):
                         print(f'RUNNING | {info["name"]} | {rate} Hz | {"PPT CONTROL" if a.control else "DRY RUN"}', flush=True)
                         last_audio = time.monotonic()
@@ -180,6 +233,9 @@ def main():
                             if overflow or time.monotonic() - captured > .5:
                                 overflow = False
                                 rec.Reset()
+                                armed_until = 0.0
+                                pending = None
+                                consumed = False
                                 while True:
                                     try: q.get_nowait()
                                     except queue.Empty: break
@@ -191,9 +247,40 @@ def main():
                                     print(f'INPUT peak block RMS: {peak_level:.1f} dBFS', flush=True)
                                     peak_level = -120.0
                                     next_meter = last_audio + 1
-                            if not rec.AcceptWaveform(data): continue
-                            result = json.loads(rec.Result())
+                            final = rec.AcceptWaveform(data)
                             now = time.monotonic()
+                            if not final and not partial_enabled: continue
+                            raw = json.loads(rec.Result() if final else rec.PartialResult())
+                            if a.wake == 'powerpoint':
+                                if consumed:
+                                    if final:
+                                        consumed = False
+                                        pending = None
+                                    continue
+                                result = wake_phrase(raw, not final, now <= armed_until)
+                                if final:
+                                    pending = None
+                                    if result is None and wake_only(raw, a.confidence):
+                                        armed_until = now + 3.0
+                                        print('ARMED | say command within 3 seconds', flush=True)
+                                        continue
+                                    armed_until = 0.0
+                                else:
+                                    # Do not execute number prefixes (five vs fifty, twenty vs twenty five).
+                                    if result is None or COMMANDS[result['text']].startswith('goto:'):
+                                        pending = None
+                                        continue
+                                    key = result['text']
+                                    if pending != key:
+                                        pending = key
+                                        pending_since = now
+                                        continue
+                                    if now-pending_since < .35: continue
+                                if result is None:
+                                    if final and a.verbose and raw.get('text'): print('IGNORED:', raw['text'], flush=True)
+                                    continue
+                            else:
+                                result = raw
                             action = decide(result,a.confidence,last,now,a.cooldown)
                             if a.verbose and result.get('text'): print('HEARD:',result,flush=True)
                             reason = validate_phrase(result, not a.no_timing_guard)
@@ -207,10 +294,12 @@ def main():
                                 continue
                             if action in ('lock', 'unlock'):
                                 locked = action == 'lock'
+                                if not final: consumed = True
                                 last = now
                                 print('LOCKED' if locked else 'UNLOCKED', flush=True)
                                 continue
                             last = now
+                            if not final: consumed = True
                             if not a.control:
                                 print('DETECTED:',result['text'],'->',action,flush=True); continue
                             try:
