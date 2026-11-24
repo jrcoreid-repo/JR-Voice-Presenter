@@ -145,6 +145,9 @@ def self_test():
     assert 'power point eighty' not in wake_grammar(100, True)
     print('PASS: separate wake and command confidence thresholds')
     print('PASS: wake phrase suffix and separate command guards')
+    assert feedback_text('next') == 'Next slide, sir.'
+    assert feedback_text('goto:25') == 'Slide twenty five, sir.'
+    print('PASS: voice feedback mapping')
     print('Self-test checks synthetic results only; no audio or PowerPoint tested.')
 
 def device_candidates(sd, explicit=None, name=None, fallback=True):
@@ -175,8 +178,28 @@ def device_candidates(sd, explicit=None, name=None, fallback=True):
 class AudioLost(Exception):
     pass
 
+def feedback_text(action):
+    if action.startswith('goto:'):
+        return 'Slide ' + number_words(int(action.split(':')[1])) + ', sir.'
+    return {'next':'Next slide, sir.', 'back':'Going back, sir.',
+            'first':'First slide.', 'last':'Last slide.',
+            'lock':'Locked.', 'unlock':'Unlocked.',
+            'black':'Screen hidden.', 'white':'White screen.',
+            'show':'Screen restored.'}.get(action, 'Done.')
+
+def init_voice():
+    try:
+        import win32com.client
+        voice = win32com.client.Dispatch('SAPI.SpVoice')
+        voice.Rate = 1
+        voice.Volume = 75
+        return voice
+    except Exception as exc:
+        print('WARN: voice feedback unavailable:', exc, flush=True)
+        return None
+
 def main():
-    p = argparse.ArgumentParser(description='JR Voice Presenter v0.6.2 experimental')
+    p = argparse.ArgumentParser(description='JR Voice Presenter v0.6.3 experimental')
     p.add_argument('--list-devices', action='store_true')
     group = p.add_mutually_exclusive_group()
     group.add_argument('--device', type=int)
@@ -191,6 +214,8 @@ def main():
     p.add_argument('--cooldown', type=float, default=1.0)
     p.add_argument('--samplerate', type=int)
     p.add_argument('--verbose', action='store_true')
+    p.add_argument('--voice', action=argparse.BooleanOptionalAction, default=False, help='Offline Windows spoken feedback')
+    p.add_argument('--voice-test', action='store_true', help='Test Windows speech without microphone or PowerPoint')
     p.add_argument('--wake', choices=['powerpoint','legacy'], default='powerpoint')
     p.add_argument('--navigation-only', action='store_true', help='Narrow wake grammar to navigation and lock commands; no slide numbers')
     p.add_argument('--final-only', action='store_true', help='Disable experimental partial-result execution')
@@ -202,6 +227,11 @@ def main():
         a.control = True
     if a.self_test:
         self_test(); return
+    if a.voice_test:
+        voice = init_voice()
+        if voice is None: raise SystemExit(1)
+        voice.Speak('Ready, sir. Next slide, sir. Going back, sir.')
+        return
     import sounddevice as sd
     if a.list_devices:
         print(sd.query_devices()); return
@@ -217,6 +247,7 @@ def main():
     model = Model(a.model)
     if a.control:
         import win32com.client
+    voice = init_voice() if a.voice else None
     last = float('-inf')
     locked = False
     try:
@@ -235,13 +266,38 @@ def main():
                 pending_since = 0.0
                 consumed = False
                 previous_partial = ''
+                mute_until = 0.0
+                speaking = False
                 q = queue.Queue(maxsize=40)
                 overflow = False
                 def callback(indata, frames, timing, status):
                     nonlocal overflow
+                    if speaking or time.monotonic() < mute_until: return
                     if status: overflow = True
                     try: q.put_nowait((time.monotonic(), bytes(indata)))
                     except queue.Full: overflow = True
+                def speak_feedback(action):
+                    nonlocal voice, speaking, mute_until, overflow, pending, armed_until, consumed, previous_partial, last_audio
+                    if voice is None: return
+                    speaking = True
+                    try:
+                        voice.Speak(feedback_text(action))
+                    except Exception as exc:
+                        print('WARN: voice feedback disabled:', exc, flush=True)
+                        voice = None
+                    finally:
+                        mute_until = time.monotonic() + .25
+                        while True:
+                            try: q.get_nowait()
+                            except queue.Empty: break
+                        overflow = False
+                        rec.Reset()
+                        pending = None
+                        armed_until = 0.0
+                        consumed = False
+                        previous_partial = ''
+                        last_audio = time.monotonic()
+                        speaking = False
                 last_audio = time.monotonic()
                 print('Say: PowerPoint next / back / five. Ctrl+C to stop.' if a.wake == 'powerpoint' else 'Say: slide next / back / five. Ctrl+C to stop.', flush=True)
                 with sd.RawInputStream(device=device, samplerate=rate, channels=1, dtype='int16', blocksize=max(1,rate//20), callback=callback):
@@ -336,6 +392,7 @@ def main():
                                     previous_partial = ''
                                 last = now
                                 print('LOCKED' if locked else 'UNLOCKED', flush=True)
+                                speak_feedback(action)
                                 continue
                             last = now
                             if not final:
@@ -344,7 +401,9 @@ def main():
                                 armed_until = 0.0
                                 previous_partial = ''
                             if not a.control:
-                                print('DETECTED:',result['text'].replace('slide ', 'PowerPoint ', 1) if a.wake == 'powerpoint' else result['text'],'->',action,flush=True); continue
+                                print('DETECTED:',result['text'].replace('slide ', 'PowerPoint ', 1) if a.wake == 'powerpoint' else result['text'],'->',action,flush=True)
+                                speak_feedback(action)
+                                continue
                             try:
                                 app = win32com.client.GetActiveObject('PowerPoint.Application')
                                 if app.SlideShowWindows.Count != 1:
@@ -365,6 +424,7 @@ def main():
                                 else: continue
                                 print('EXECUTED:',result['text'].replace('slide ', 'PowerPoint ', 1) if a.wake == 'powerpoint' else result['text'],flush=True)
                             except Exception as exc: print('PPT ERROR:',exc,flush=True)
+                            else: speak_feedback(action)
             except (sd.PortAudioError, AudioLost, ValueError) as exc:
                 print(f'WARN: microphone {device} failed: {exc}; trying next input', flush=True)
         print('PAUSED: no usable microphone. Reconnect and restart; no commands executed.', flush=True)
