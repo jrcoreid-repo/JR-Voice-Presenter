@@ -16,6 +16,10 @@ if errorlevel 1 goto fail
 if errorlevel 1 goto fail
 robocopy "models\vosk-model-small-en-us-0.15" "dist\JR-Voice-Presenter\models\vosk-model-small-en-us-0.15" /E
 if errorlevel 8 goto fail
+if exist "voice_pack\*.mp3" (
+  robocopy "voice_pack" "dist\JR-Voice-Presenter\voice_pack" /E
+  if errorlevel 8 goto fail
+)
 "dist\JR-Voice-Presenter\JR-Voice-Presenter.exe" --self-test
 if errorlevel 1 goto fail
 "dist\JR-Voice-Presenter\JR-Voice-Presenter.exe" --list-devices
