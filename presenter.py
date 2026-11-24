@@ -24,33 +24,41 @@ def decide(result, threshold, last, now, cooldown):
         return None
     return COMMANDS[text]
 
-def select_device(sd, explicit=None, name=None):
+def device_candidates(sd, explicit=None, name=None, fallback=True):
     devices = sd.query_devices()
     hosts = sd.query_hostapis()
     if explicit is not None:
         sd.query_devices(explicit, 'input')
-        return explicit
+        return [explicit]
     candidates = [(i,d) for i,d in enumerate(devices) if d['max_input_channels'] > 0]
     def rank(item):
         i,d = item
         host = hosts[d['hostapi']]['name'].lower()
-        return (0 if 'wasapi' in host else 1 if 'mme' in host else 2, i)
-    if name:
-        matches = [item for item in candidates if name.casefold() in item[1]['name'].casefold()]
-        if not matches: raise ValueError('No input device matching ' + name)
-        return min(matches, key=rank)[0]
-    matches = [item for item in candidates if 'jbl tune125bt' in item[1]['name'].lower()]
-    if matches: return min(matches, key=rank)[0]
-    default = int(sd.default.device[0])
-    sd.query_devices(default, 'input')
-    return default
+        return (0 if 'wasapi' in host else 1 if 'mme' in host else 2 if 'directsound' in host else 3, i)
+    def is_internal(d):
+        n = d['name'].lower()
+        return ('microphone' in n or 'mic input' in n) and 'realtek' in n
+    preferred = [item for item in candidates if (name or 'jbl tune125bt').casefold() in item[1]['name'].casefold()]
+    internal = [item for item in candidates if is_internal(item[1])]
+    order = [i for i,d in sorted(preferred, key=rank)]
+    if fallback and (not name or 'jbl' in name.casefold()):
+        order += [i for i,d in sorted(internal, key=rank)]
+    if not name and (fallback or not preferred):
+        default = int(sd.default.device[0])
+        if any(i == default for i,d in candidates):
+            order.append(default)
+    return list(dict.fromkeys(order))
+
+class AudioLost(Exception):
+    pass
 
 def main():
-    p = argparse.ArgumentParser(description='JR Voice Presenter v0.3')
+    p = argparse.ArgumentParser(description='JR Voice Presenter v0.3.1')
     p.add_argument('--list-devices', action='store_true')
     group = p.add_mutually_exclusive_group()
     group.add_argument('--device', type=int)
     group.add_argument('--mic', help='Input device name substring, e.g. Realtek or JBL')
+    p.add_argument('--no-fallback', action='store_true', help='Do not switch to internal microphone after JBL failure')
     p.add_argument('--model', default=str(Path(__file__).parent / 'models' / 'vosk-model-small-en-us-0.15'))
     p.add_argument('--control', action='store_true', help='Enable PowerPoint control; default is dry run')
     p.add_argument('--grammar', action=argparse.BooleanOptionalAction, default=True, help='Constrained vocabulary (default)')
@@ -68,83 +76,93 @@ def main():
     if not 0 <= a.confidence <= 1 or a.cooldown < 0: p.error('Invalid confidence or cooldown')
     SetLogLevel(-1)
     try:
-        a.device = select_device(sd, a.device, a.mic)
-        info = sd.query_devices(a.device, 'input')
-        print(f"MIC SELECTED: {a.device} | {info['name']} | {sd.query_hostapis(info['hostapi'])['name']}", flush=True)
+        candidates = device_candidates(sd, a.device, a.mic, not a.no_fallback)
     except (ValueError, sd.PortAudioError, IndexError) as exc:
-        p.error(f'Microphone selection failed: {exc}. Run --list-devices or omit --device.')
-    rate = a.samplerate or int(sd.query_devices(a.device, 'input')['default_samplerate'])
+        p.error(f'Microphone selection failed: {exc}')
+    if not candidates: p.error('No matching input microphone. Run --list-devices.')
     model = Model(a.model)
-    rec = KaldiRecognizer(model, rate, json.dumps([k for k,v in COMMANDS.items() if not v.startswith('goto:') or int(v.split(':')[1]) <= a.max_slide]+['[unk]'])) if a.grammar else KaldiRecognizer(model, rate)
-    rec.SetWords(True)
     if a.control:
         import win32com.client
-    q = queue.Queue(maxsize=40)
-    overflow = False
-    def callback(indata, frames, timing, status):
-        nonlocal overflow
-        if status: overflow = True
-        try: q.put_nowait((time.monotonic(), bytes(indata)))
-        except queue.Full: overflow = True
     last = float('-inf')
-    last_audio = time.monotonic()
     locked = False
-    print(f'RUNNING | {sd.query_devices(a.device, "input")["name"]} | {rate} Hz | {"PPT CONTROL" if a.control else "DRY RUN"}', flush=True)
-    print('Say: slide next / slide back / slide five / slide lock. Ctrl+C to stop.', flush=True)
     try:
-        with sd.RawInputStream(device=a.device, samplerate=rate, channels=1, dtype='int16', blocksize=max(1,rate//20), callback=callback):
-            while True:
-                try: captured, data = q.get(timeout=1)
-                except queue.Empty:
-                    if time.monotonic() - last_audio > 3:
-                        raise SystemExit('Microphone stopped sending audio. Restart to select a fresh device.')
-                    continue
+        for device in candidates:
+            try:
+                info = sd.query_devices(device, 'input')
+                rate = a.samplerate or int(info['default_samplerate'])
+                print(f"TRY MIC: {device} | {info['name']} | {sd.query_hostapis(info['hostapi'])['name']}", flush=True)
+                rec = KaldiRecognizer(model, rate, json.dumps([k for k,v in COMMANDS.items() if not v.startswith('goto:') or int(v.split(':')[1]) <= a.max_slide]+['[unk]'])) if a.grammar else KaldiRecognizer(model, rate)
+                rec.SetWords(True)
+                q = queue.Queue(maxsize=40)
+                overflow = False
+                def callback(indata, frames, timing, status):
+                    nonlocal overflow
+                    if status: overflow = True
+                    try: q.put_nowait((time.monotonic(), bytes(indata)))
+                    except queue.Full: overflow = True
                 last_audio = time.monotonic()
-                if overflow or time.monotonic() - captured > .5:
-                    overflow = False
-                    rec.Reset()
-                    while True:
-                        try: q.get_nowait()
-                        except queue.Empty: break
-                    print('WARN: audio dropped; recognition reset', flush=True)
-                    continue
-                if not rec.AcceptWaveform(data): continue
-                result = json.loads(rec.Result())
-                now = time.monotonic()
-                action = decide(result,a.confidence,last,now,a.cooldown)
-                if a.verbose and result.get('text'): print('HEARD:',result,flush=True)
-                if not action: continue
-                if action.startswith('goto:') and int(action.split(':')[1]) > a.max_slide: continue
-                if locked and action != 'unlock': continue
-                if action in ('lock', 'unlock'):
-                    locked = action == 'lock'
-                    last = now
-                    print('LOCKED' if locked else 'UNLOCKED', flush=True)
-                    continue
-                last = now
-                if not a.control:
-                    print('DETECTED:',result['text'],'->',action,flush=True); continue
-                try:
-                    app = win32com.client.GetActiveObject('PowerPoint.Application')
-                    if app.SlideShowWindows.Count != 1:
-                        print('SKIP: exactly one slideshow must be running',flush=True); continue
-                    view = app.SlideShowWindows(1).View
-                    if action == 'next': view.Next()
-                    elif action == 'back': view.Previous()
-                    elif action == 'first': view.First()
-                    elif action == 'last': view.Last()
-                    elif action == 'black': view.State = 3
-                    elif action == 'white': view.State = 4
-                    elif action == 'show': view.State = 1
-                    elif action.startswith('goto:'):
-                        n = int(action.split(':')[1])
-                        if not 1 <= n <= app.SlideShowWindows(1).Presentation.Slides.Count:
-                            print('SKIP: slide out of range', flush=True); continue
-                        view.GotoSlide(n)
-                    else: continue
-                    print('EXECUTED:',result['text'],flush=True)
-                except Exception as exc: print('PPT ERROR:',exc,flush=True)
-    except KeyboardInterrupt: print('\nSTOPPED')
-    except sd.PortAudioError as exc: raise SystemExit(f'Microphone error: {exc}. Reconnect microphone and restart; device selection will refresh.')
+                print('Say: slide next / slide back / slide five / slide lock. Ctrl+C to stop.', flush=True)
+                with sd.RawInputStream(device=device, samplerate=rate, channels=1, dtype='int16', blocksize=max(1,rate//20), callback=callback):
+                        print(f'RUNNING | {info["name"]} | {rate} Hz | {"PPT CONTROL" if a.control else "DRY RUN"}', flush=True)
+                        last_audio = time.monotonic()
+                        warmup_until = last_audio + .5
+                        last = max(last, last_audio)
+                        while True:
+                            try: captured, data = q.get(timeout=1)
+                            except queue.Empty:
+                                if time.monotonic() - last_audio > 3:
+                                    raise AudioLost('Microphone stopped sending audio')
+                                continue
+                            last_audio = time.monotonic()
+                            if captured < warmup_until: continue
+                            if overflow or time.monotonic() - captured > .5:
+                                overflow = False
+                                rec.Reset()
+                                while True:
+                                    try: q.get_nowait()
+                                    except queue.Empty: break
+                                print('WARN: audio dropped; recognition reset', flush=True)
+                                continue
+                            if not rec.AcceptWaveform(data): continue
+                            result = json.loads(rec.Result())
+                            now = time.monotonic()
+                            action = decide(result,a.confidence,last,now,a.cooldown)
+                            if a.verbose and result.get('text'): print('HEARD:',result,flush=True)
+                            if not action: continue
+                            if action.startswith('goto:') and int(action.split(':')[1]) > a.max_slide: continue
+                            if locked and action != 'unlock': continue
+                            if action in ('lock', 'unlock'):
+                                locked = action == 'lock'
+                                last = now
+                                print('LOCKED' if locked else 'UNLOCKED', flush=True)
+                                continue
+                            last = now
+                            if not a.control:
+                                print('DETECTED:',result['text'],'->',action,flush=True); continue
+                            try:
+                                app = win32com.client.GetActiveObject('PowerPoint.Application')
+                                if app.SlideShowWindows.Count != 1:
+                                    print('SKIP: exactly one slideshow must be running',flush=True); continue
+                                view = app.SlideShowWindows(1).View
+                                if action == 'next': view.Next()
+                                elif action == 'back': view.Previous()
+                                elif action == 'first': view.First()
+                                elif action == 'last': view.Last()
+                                elif action == 'black': view.State = 3
+                                elif action == 'white': view.State = 4
+                                elif action == 'show': view.State = 1
+                                elif action.startswith('goto:'):
+                                    n = int(action.split(':')[1])
+                                    if not 1 <= n <= app.SlideShowWindows(1).Presentation.Slides.Count:
+                                        print('SKIP: slide out of range', flush=True); continue
+                                    view.GotoSlide(n)
+                                else: continue
+                                print('EXECUTED:',result['text'],flush=True)
+                            except Exception as exc: print('PPT ERROR:',exc,flush=True)
+            except (sd.PortAudioError, AudioLost, ValueError) as exc:
+                print(f'WARN: microphone {device} failed: {exc}; trying next input', flush=True)
+        print('PAUSED: no usable microphone. Reconnect and restart; no commands executed.', flush=True)
+    except KeyboardInterrupt:
+        print('\nSTOPPED')
 
 if __name__ == '__main__': main()
