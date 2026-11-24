@@ -91,9 +91,11 @@ def wake_only(result, threshold):
     size = 1 if tokens[-1:] == ['powerpoint'] else (2 if tokens[-2:] == ['power','point'] else 0)
     return bool(size and all(w.get('conf',0) >= threshold for w in words[-size:]))
 
-def wake_grammar(limit):
+def wake_grammar(limit, navigation_only=False):
     tails = [k[6:] for k,v in COMMANDS.items()
              if not v.startswith('goto:') or int(v.split(':')[1]) <= limit]
+    if navigation_only:
+        tails = [t for t in tails if t in ('next','back','first','last','lock','unlock','black','white','show')]
     return ['[unk]', 'powerpoint', 'power point'] + tails + [
         prefix + ' ' + tail for prefix in ('powerpoint','power point') for tail in tails]
 
@@ -136,6 +138,11 @@ def self_test():
     assert decide_wake(result,.80,.85,-100,10,1) is None
     result['result'][1]['conf'] = .84
     assert decide_wake(result,.70,.85,-100,10,1) is None
+    result = wake_phrase(sample('power point next'))
+    result['result'][0]['conf'] = .571695
+    assert decide_wake(result,.55,.85,-100,10,1) == 'next'
+    assert 'power point next' in wake_grammar(100, True)
+    assert 'power point eighty' not in wake_grammar(100, True)
     print('PASS: separate wake and command confidence thresholds')
     print('PASS: wake phrase suffix and separate command guards')
     print('Self-test checks synthetic results only; no audio or PowerPoint tested.')
@@ -169,7 +176,7 @@ class AudioLost(Exception):
     pass
 
 def main():
-    p = argparse.ArgumentParser(description='JR Voice Presenter v0.6.1 experimental')
+    p = argparse.ArgumentParser(description='JR Voice Presenter v0.6.2 experimental')
     p.add_argument('--list-devices', action='store_true')
     group = p.add_mutually_exclusive_group()
     group.add_argument('--device', type=int)
@@ -180,11 +187,12 @@ def main():
     p.add_argument('--grammar', action=argparse.BooleanOptionalAction, default=True, help='Constrained vocabulary (default)')
     p.add_argument('--max-slide', type=int, default=100, choices=range(1,201), metavar='1-200')
     p.add_argument('--confidence', type=float, default=.85)
-    p.add_argument('--wake-confidence', type=float, default=.70, help='Separate wake phrase confidence threshold')
+    p.add_argument('--wake-confidence', type=float, default=.55, help='Separate wake phrase confidence threshold')
     p.add_argument('--cooldown', type=float, default=1.0)
     p.add_argument('--samplerate', type=int)
     p.add_argument('--verbose', action='store_true')
     p.add_argument('--wake', choices=['powerpoint','legacy'], default='powerpoint')
+    p.add_argument('--navigation-only', action='store_true', help='Narrow wake grammar to navigation and lock commands; no slide numbers')
     p.add_argument('--final-only', action='store_true', help='Disable experimental partial-result execution')
     p.add_argument('--self-test', action='store_true', help='Run synthetic command guard tests')
     p.add_argument('--diagnostic', action='store_true', help='Show input level and rejection reasons')
@@ -217,7 +225,7 @@ def main():
                 info = sd.query_devices(device, 'input')
                 rate = a.samplerate or int(info['default_samplerate'])
                 print(f"TRY MIC: {device} | {info['name']} | {sd.query_hostapis(info['hostapi'])['name']}", flush=True)
-                grammar = wake_grammar(a.max_slide) if a.wake == 'powerpoint' else [k for k,v in COMMANDS.items() if not v.startswith('goto:') or int(v.split(':')[1]) <= a.max_slide]+['[unk]']
+                grammar = wake_grammar(a.max_slide, a.navigation_only) if a.wake == 'powerpoint' else [k for k,v in COMMANDS.items() if not v.startswith('goto:') or int(v.split(':')[1]) <= a.max_slide]+['[unk]']
                 rec = KaldiRecognizer(model, rate, json.dumps(grammar)) if a.grammar else KaldiRecognizer(model, rate)
                 rec.SetWords(True)
                 partial_enabled = a.wake == 'powerpoint' and not a.final_only and hasattr(rec, 'SetPartialWords')
@@ -226,6 +234,7 @@ def main():
                 pending = None
                 pending_since = 0.0
                 consumed = False
+                previous_partial = ''
                 q = queue.Queue(maxsize=40)
                 overflow = False
                 def callback(indata, frames, timing, status):
@@ -271,6 +280,10 @@ def main():
                             now = time.monotonic()
                             if not final and not partial_enabled: continue
                             raw = json.loads(rec.Result() if final else rec.PartialResult())
+                            if not final and a.verbose and raw.get('partial') != previous_partial:
+                                previous_partial = raw.get('partial', '')
+                                if previous_partial: print('PARTIAL:', previous_partial, flush=True)
+                            if final: previous_partial = ''
                             if a.verbose and final and raw.get('text'):
                                 print('RAW:', raw, flush=True)
                             if a.wake == 'powerpoint':
@@ -307,21 +320,29 @@ def main():
                             if a.verbose and result.get('text'): print('MATCH:',result,flush=True)
                             reason = validate_phrase(result, not a.no_timing_guard)
                             if reason or not action:
-                                if a.diagnostic and result.get('text'):
+                                if (a.verbose or a.diagnostic) and result.get('text') and final:
                                     print('REJECT:', reason or confidence_reason(result, a.wake_confidence if a.wake == 'powerpoint' else a.confidence, a.confidence) or 'cooldown', flush=True)
                                 continue
-                            if action.startswith('goto:') and int(action.split(':')[1]) > a.max_slide: continue
+                            if action.startswith('goto:') and (int(action.split(':')[1]) > a.max_slide or (a.wake == 'powerpoint' and a.navigation_only)): continue
                             if locked and action != 'unlock':
                                 if a.diagnostic: print('REJECT: locked', flush=True)
                                 continue
                             if action in ('lock', 'unlock'):
                                 locked = action == 'lock'
-                                if not final: consumed = True
+                                if not final:
+                                    rec.Reset()
+                                    pending = None
+                                    armed_until = 0.0
+                                    previous_partial = ''
                                 last = now
                                 print('LOCKED' if locked else 'UNLOCKED', flush=True)
                                 continue
                             last = now
-                            if not final: consumed = True
+                            if not final:
+                                rec.Reset()
+                                pending = None
+                                armed_until = 0.0
+                                previous_partial = ''
                             if not a.control:
                                 print('DETECTED:',result['text'].replace('slide ', 'PowerPoint ', 1) if a.wake == 'powerpoint' else result['text'],'->',action,flush=True); continue
                             try:
