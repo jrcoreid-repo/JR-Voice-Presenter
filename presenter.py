@@ -147,6 +147,8 @@ def self_test():
     print('PASS: wake phrase suffix and separate command guards')
     assert feedback_text('next') == 'Next slide, sir.'
     assert feedback_text('goto:25') == 'Slide twenty five, sir.'
+    assert voice_clip(Path('voice_pack'), 'next').name == 'next.mp3'
+    assert voice_clip(Path('voice_pack'), 'goto:25').name == 'goto.mp3'
     print('PASS: voice feedback mapping')
     print('Self-test checks synthetic results only; no audio or PowerPoint tested.')
 
@@ -185,9 +187,47 @@ def feedback_text(action):
             'first':'First slide.', 'last':'Last slide.',
             'lock':'Locked.', 'unlock':'Unlocked.',
             'black':'Screen hidden.', 'white':'White screen.',
-            'show':'Screen restored.'}.get(action, 'Done.')
+            'show':'Screen restored.', 'startup':'All systems operational. Welcome back, sir.'}.get(action, 'Done.')
 
-def init_voice():
+def voice_clip(root, action):
+    key = 'goto' if action.startswith('goto:') else action
+    return root / (key + '.mp3')
+
+class VoiceFeedback:
+    def __init__(self, root):
+        self.root = root
+        self.sapi = None
+        self.sapi_tried = False
+
+    def play(self, action):
+        clip = voice_clip(self.root, action)
+        if clip.is_file():
+            try:
+                self.play_mp3(clip)
+                return
+            except Exception as exc:
+                print('WARN: MP3 playback failed:', exc, flush=True)
+        if not self.sapi_tried:
+            self.sapi_tried = True
+            self.sapi = init_sapi()
+        if self.sapi is not None:
+            self.sapi.Speak(feedback_text(action))
+
+    @staticmethod
+    def play_mp3(path):
+        import ctypes
+        mci = ctypes.windll.winmm.mciSendStringW
+        def send(command):
+            code = mci(command, None, 0, None)
+            if code:
+                raise RuntimeError(f'MCI error {code}: {command}')
+        send(f'open "{path.resolve()}" type mpegvideo alias jrvoice')
+        try:
+            send('play jrvoice wait')
+        finally:
+            mci('close jrvoice', None, 0, None)
+
+def init_sapi():
     try:
         import win32com.client
         voice = win32com.client.Dispatch('SAPI.SpVoice')
@@ -199,7 +239,7 @@ def init_voice():
         return None
 
 def main():
-    p = argparse.ArgumentParser(description='JR Voice Presenter v0.6.3 experimental')
+    p = argparse.ArgumentParser(description='JR Voice Presenter v0.6.4 experimental')
     p.add_argument('--list-devices', action='store_true')
     group = p.add_mutually_exclusive_group()
     group.add_argument('--device', type=int)
@@ -214,7 +254,8 @@ def main():
     p.add_argument('--cooldown', type=float, default=1.0)
     p.add_argument('--samplerate', type=int)
     p.add_argument('--verbose', action='store_true')
-    p.add_argument('--voice', action=argparse.BooleanOptionalAction, default=False, help='Offline Windows spoken feedback')
+    p.add_argument('--voice', action=argparse.BooleanOptionalAction, default=False, help='Offline MP3 voice pack, with Windows speech fallback')
+    p.add_argument('--voice-pack', type=Path, default=(Path(sys.executable).resolve().parent if getattr(sys, 'frozen', False) else Path(__file__).resolve().parent) / 'voice_pack')
     p.add_argument('--voice-test', action='store_true', help='Test Windows speech without microphone or PowerPoint')
     p.add_argument('--wake', choices=['powerpoint','legacy'], default='powerpoint')
     p.add_argument('--navigation-only', action='store_true', help='Narrow wake grammar to navigation and lock commands; no slide numbers')
@@ -228,9 +269,9 @@ def main():
     if a.self_test:
         self_test(); return
     if a.voice_test:
-        voice = init_voice()
-        if voice is None: raise SystemExit(1)
-        voice.Speak('Ready, sir. Next slide, sir. Going back, sir.')
+        voice = VoiceFeedback(a.voice_pack)
+        for action in ('startup', 'next', 'back'):
+            voice.play(action)
         return
     import sounddevice as sd
     if a.list_devices:
@@ -247,7 +288,11 @@ def main():
     model = Model(a.model)
     if a.control:
         import win32com.client
-    voice = init_voice() if a.voice else None
+    voice = VoiceFeedback(a.voice_pack) if a.voice else None
+    if voice is not None:
+        print(f'VOICE PACK: {a.voice_pack}', flush=True)
+        try: voice.play('startup')
+        except Exception as exc: print('WARN: startup voice failed:', exc, flush=True)
     last = float('-inf')
     locked = False
     try:
@@ -281,7 +326,7 @@ def main():
                     if voice is None: return
                     speaking = True
                     try:
-                        voice.Speak(feedback_text(action))
+                        voice.play(action)
                     except Exception as exc:
                         print('WARN: voice feedback disabled:', exc, flush=True)
                         voice = None
