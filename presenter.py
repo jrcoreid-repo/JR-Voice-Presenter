@@ -1,4 +1,6 @@
 import argparse
+import math
+from array import array
 import json
 import queue
 import time
@@ -23,6 +25,56 @@ def decide(result, threshold, last, now, cooldown):
     if text not in COMMANDS or not words or min(w.get('conf', 0) for w in words) < threshold or now-last < cooldown:
         return None
     return COMMANDS[text]
+
+def validate_phrase(result, strict=True):
+    text = result.get('text', '').strip().lower()
+    words = result.get('result', [])
+    if text not in COMMANDS: return 'not a command'
+    if not words or ' '.join(w.get('word', '') for w in words) != text:
+        return 'word mismatch'
+    if not strict: return None
+    try:
+        spans = [(float(w['start']), float(w['end'])) for w in words]
+        if any(not math.isfinite(v) for pair in spans for v in pair):
+            return 'invalid timing'
+        if any(not .06 <= end-start <= 2.0 for start,end in spans):
+            return 'word duration'
+        if not .24 <= spans[-1][1]-spans[0][0] <= 5.0:
+            return 'phrase duration'
+        if any(b[0]-a[1] > .8 or b[0]-a[1] < -.15 for a,b in zip(spans,spans[1:])):
+            return 'word spacing'
+    except (KeyError, TypeError, ValueError):
+        return 'missing timing'
+    return None
+
+def rms_dbfs(data):
+    samples = array('h', data)
+    if not samples: return -120.0
+    rms = math.sqrt(sum(v*v for v in samples)/len(samples))
+    return 20*math.log10(max(rms, .033)/32768)
+
+def self_test():
+    def sample(text):
+        return {'text': text, 'result': [{'word': w, 'conf': .99, 'start': i*.4, 'end': i*.4+.35} for i,w in enumerate(text.split())]}
+    cases = [('slide next', True), ('slide back', True), ('slide twenty five', True),
+             ('slide lock', True), ('slide unlock', True), ('slide close', False),
+             ('slide [unk]', False), ('[unk]', False), ('next', False),
+             ('please slide next', False)]
+    for phrase, expected in cases:
+        result = sample(phrase)
+        actual = validate_phrase(result) is None and decide(result,.85,-100,10,1) is not None
+        if actual != expected: raise AssertionError(phrase)
+        print('PASS:', phrase, '->', 'accept' if actual else 'reject')
+    result = sample('slide next')
+    result['result'][1]['start'] = 2
+    result['result'][1]['end'] = 2.4
+    assert validate_phrase(result) == 'word spacing'
+    result = sample('slide next')
+    result['result'][1]['conf'] = .4
+    assert decide(result,.85,-100,10,1) is None
+    assert decide(sample('slide next'),.85,9.5,10,1) is None
+    print('PASS: timing, confidence and cooldown guards')
+    print('Self-test checks synthetic results only; no audio or PowerPoint tested.')
 
 def device_candidates(sd, explicit=None, name=None, fallback=True):
     devices = sd.query_devices()
@@ -53,7 +105,7 @@ class AudioLost(Exception):
     pass
 
 def main():
-    p = argparse.ArgumentParser(description='JR Voice Presenter v0.3.1')
+    p = argparse.ArgumentParser(description='JR Voice Presenter v0.4')
     p.add_argument('--list-devices', action='store_true')
     group = p.add_mutually_exclusive_group()
     group.add_argument('--device', type=int)
@@ -67,7 +119,12 @@ def main():
     p.add_argument('--cooldown', type=float, default=1.0)
     p.add_argument('--samplerate', type=int)
     p.add_argument('--verbose', action='store_true')
+    p.add_argument('--self-test', action='store_true', help='Run synthetic command guard tests')
+    p.add_argument('--diagnostic', action='store_true', help='Show input level and rejection reasons')
+    p.add_argument('--no-timing-guard', action='store_true', help='Disable experimental duration checks for A/B tests')
     a = p.parse_args()
+    if a.self_test:
+        self_test(); return
     import sounddevice as sd
     if a.list_devices:
         print(sd.query_devices()); return
@@ -106,6 +163,8 @@ def main():
                         print(f'RUNNING | {info["name"]} | {rate} Hz | {"PPT CONTROL" if a.control else "DRY RUN"}', flush=True)
                         last_audio = time.monotonic()
                         warmup_until = last_audio + .5
+                        next_meter = last_audio + 1
+                        peak_level = -120.0
                         last = max(last, last_audio)
                         while True:
                             try: captured, data = q.get(timeout=1)
@@ -123,14 +182,26 @@ def main():
                                     except queue.Empty: break
                                 print('WARN: audio dropped; recognition reset', flush=True)
                                 continue
+                            if a.diagnostic:
+                                peak_level = max(peak_level, rms_dbfs(data))
+                                if last_audio >= next_meter:
+                                    print(f'INPUT peak block RMS: {peak_level:.1f} dBFS', flush=True)
+                                    peak_level = -120.0
+                                    next_meter = last_audio + 1
                             if not rec.AcceptWaveform(data): continue
                             result = json.loads(rec.Result())
                             now = time.monotonic()
                             action = decide(result,a.confidence,last,now,a.cooldown)
                             if a.verbose and result.get('text'): print('HEARD:',result,flush=True)
-                            if not action: continue
+                            reason = validate_phrase(result, not a.no_timing_guard)
+                            if reason or not action:
+                                if a.diagnostic and result.get('text'):
+                                    print('REJECT:', reason or 'confidence/cooldown', flush=True)
+                                continue
                             if action.startswith('goto:') and int(action.split(':')[1]) > a.max_slide: continue
-                            if locked and action != 'unlock': continue
+                            if locked and action != 'unlock':
+                                if a.diagnostic: print('REJECT: locked', flush=True)
+                                continue
                             if action in ('lock', 'unlock'):
                                 locked = action == 'lock'
                                 last = now
