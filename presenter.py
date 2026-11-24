@@ -27,6 +27,18 @@ def decide(result, threshold, last, now, cooldown):
         return None
     return COMMANDS[text]
 
+def confidence_reason(result, wake_threshold, command_threshold):
+    words = result.get('result', [])
+    if not words: return 'missing word confidence'
+    if words[0].get('conf', 0) < wake_threshold: return 'wake confidence'
+    if any(w.get('conf', 0) < command_threshold for w in words[1:]): return 'command confidence'
+    return None
+
+def decide_wake(result, wake_threshold, command_threshold, last, now, cooldown):
+    if now-last < cooldown or confidence_reason(result, wake_threshold, command_threshold):
+        return None
+    return COMMANDS.get(result.get('text', '').strip().lower())
+
 def validate_phrase(result, strict=True):
     text = result.get('text', '').strip().lower()
     words = result.get('result', [])
@@ -118,6 +130,13 @@ def self_test():
     assert wake_phrase(sample('power point close')) is None
     assert wake_phrase(sample('five'), armed=True)['text'] == 'slide five'
     assert wake_only(sample('ordinary words power point'), .85)
+    result = wake_phrase(sample('power point next'))
+    result['result'][0]['conf'] = .756585
+    assert decide_wake(result,.70,.85,-100,10,1) == 'next'
+    assert decide_wake(result,.80,.85,-100,10,1) is None
+    result['result'][1]['conf'] = .84
+    assert decide_wake(result,.70,.85,-100,10,1) is None
+    print('PASS: separate wake and command confidence thresholds')
     print('PASS: wake phrase suffix and separate command guards')
     print('Self-test checks synthetic results only; no audio or PowerPoint tested.')
 
@@ -150,7 +169,7 @@ class AudioLost(Exception):
     pass
 
 def main():
-    p = argparse.ArgumentParser(description='JR Voice Presenter v0.6 experimental')
+    p = argparse.ArgumentParser(description='JR Voice Presenter v0.6.1 experimental')
     p.add_argument('--list-devices', action='store_true')
     group = p.add_mutually_exclusive_group()
     group.add_argument('--device', type=int)
@@ -161,6 +180,7 @@ def main():
     p.add_argument('--grammar', action=argparse.BooleanOptionalAction, default=True, help='Constrained vocabulary (default)')
     p.add_argument('--max-slide', type=int, default=100, choices=range(1,201), metavar='1-200')
     p.add_argument('--confidence', type=float, default=.85)
+    p.add_argument('--wake-confidence', type=float, default=.70, help='Separate wake phrase confidence threshold')
     p.add_argument('--cooldown', type=float, default=1.0)
     p.add_argument('--samplerate', type=int)
     p.add_argument('--verbose', action='store_true')
@@ -179,7 +199,7 @@ def main():
         print(sd.query_devices()); return
     from vosk import Model, KaldiRecognizer, SetLogLevel
     if not Path(a.model).is_dir(): p.error('Model missing. Run setup_model.py first.')
-    if not 0 <= a.confidence <= 1 or a.cooldown < 0: p.error('Invalid confidence or cooldown')
+    if not 0 <= a.confidence <= 1 or not 0 <= a.wake_confidence <= 1 or a.cooldown < 0: p.error('Invalid confidence or cooldown')
     SetLogLevel(-1)
     try:
         candidates = device_candidates(sd, a.device, a.mic, not a.no_fallback)
@@ -251,6 +271,8 @@ def main():
                             now = time.monotonic()
                             if not final and not partial_enabled: continue
                             raw = json.loads(rec.Result() if final else rec.PartialResult())
+                            if a.verbose and final and raw.get('text'):
+                                print('RAW:', raw, flush=True)
                             if a.wake == 'powerpoint':
                                 if consumed:
                                     if final:
@@ -260,7 +282,7 @@ def main():
                                 result = wake_phrase(raw, not final, now <= armed_until)
                                 if final:
                                     pending = None
-                                    if result is None and wake_only(raw, a.confidence):
+                                    if result is None and wake_only(raw, a.wake_confidence):
                                         armed_until = now + 3.0
                                         print('ARMED | say command within 3 seconds', flush=True)
                                         continue
@@ -281,12 +303,12 @@ def main():
                                     continue
                             else:
                                 result = raw
-                            action = decide(result,a.confidence,last,now,a.cooldown)
-                            if a.verbose and result.get('text'): print('HEARD:',result,flush=True)
+                            action = decide_wake(result,a.wake_confidence,a.confidence,last,now,a.cooldown) if a.wake == 'powerpoint' else decide(result,a.confidence,last,now,a.cooldown)
+                            if a.verbose and result.get('text'): print('MATCH:',result,flush=True)
                             reason = validate_phrase(result, not a.no_timing_guard)
                             if reason or not action:
                                 if a.diagnostic and result.get('text'):
-                                    print('REJECT:', reason or 'confidence/cooldown', flush=True)
+                                    print('REJECT:', reason or confidence_reason(result, a.wake_confidence if a.wake == 'powerpoint' else a.confidence, a.confidence) or 'cooldown', flush=True)
                                 continue
                             if action.startswith('goto:') and int(action.split(':')[1]) > a.max_slide: continue
                             if locked and action != 'unlock':
@@ -301,7 +323,7 @@ def main():
                             last = now
                             if not final: consumed = True
                             if not a.control:
-                                print('DETECTED:',result['text'],'->',action,flush=True); continue
+                                print('DETECTED:',result['text'].replace('slide ', 'PowerPoint ', 1) if a.wake == 'powerpoint' else result['text'],'->',action,flush=True); continue
                             try:
                                 app = win32com.client.GetActiveObject('PowerPoint.Application')
                                 if app.SlideShowWindows.Count != 1:
@@ -320,7 +342,7 @@ def main():
                                         print('SKIP: slide out of range', flush=True); continue
                                     view.GotoSlide(n)
                                 else: continue
-                                print('EXECUTED:',result['text'],flush=True)
+                                print('EXECUTED:',result['text'].replace('slide ', 'PowerPoint ', 1) if a.wake == 'powerpoint' else result['text'],flush=True)
                             except Exception as exc: print('PPT ERROR:',exc,flush=True)
             except (sd.PortAudioError, AudioLost, ValueError) as exc:
                 print(f'WARN: microphone {device} failed: {exc}; trying next input', flush=True)
