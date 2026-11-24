@@ -4,7 +4,18 @@ import queue
 import time
 from pathlib import Path
 
-COMMANDS = {'slide next': 'next', 'slide back': 'back', 'slide lanjut': 'next', 'slide kembali': 'back'}
+ONES = 'zero one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen'.split()
+TENS = 'zero ten twenty thirty forty fifty sixty seventy eighty ninety'.split()
+
+def number_words(n):
+    if n < 20: return ONES[n]
+    if n < 100: return TENS[n//10] + (' ' + ONES[n%10] if n%10 else '')
+    return ONES[n//100] + ' hundred' + (' ' + number_words(n%100) if n%100 else '')
+
+COMMANDS = {'slide next': 'next', 'slide back': 'back', 'slide first': 'first',
+            'slide last': 'last', 'slide black': 'black', 'slide white': 'white',
+            'slide show': 'show', 'slide lock': 'lock', 'slide unlock': 'unlock'}
+COMMANDS.update({'slide ' + number_words(n): 'goto:' + str(n) for n in range(1, 201)})
 
 def decide(result, threshold, last, now, cooldown):
     text = result.get('text', '').strip().lower()
@@ -14,12 +25,13 @@ def decide(result, threshold, last, now, cooldown):
     return COMMANDS[text]
 
 def main():
-    p = argparse.ArgumentParser(description='JR Voice Presenter v0.1')
+    p = argparse.ArgumentParser(description='JR Voice Presenter v0.2')
     p.add_argument('--list-devices', action='store_true')
     p.add_argument('--device', type=int)
     p.add_argument('--model', default=str(Path(__file__).parent / 'models' / 'vosk-model-small-en-us-0.15'))
     p.add_argument('--control', action='store_true', help='Enable PowerPoint control; default is dry run')
-    p.add_argument('--grammar', action='store_true', help='Experimental constrained vocabulary')
+    p.add_argument('--grammar', action=argparse.BooleanOptionalAction, default=True, help='Constrained vocabulary (default)')
+    p.add_argument('--max-slide', type=int, default=100, choices=range(1,201), metavar='1-200')
     p.add_argument('--confidence', type=float, default=.85)
     p.add_argument('--cooldown', type=float, default=1.0)
     p.add_argument('--samplerate', type=int)
@@ -34,7 +46,7 @@ def main():
     SetLogLevel(-1)
     rate = a.samplerate or int(sd.query_devices(a.device, 'input')['default_samplerate'])
     model = Model(a.model)
-    rec = KaldiRecognizer(model, rate, json.dumps(list(COMMANDS)+['[unk]'])) if a.grammar else KaldiRecognizer(model, rate)
+    rec = KaldiRecognizer(model, rate, json.dumps([k for k,v in COMMANDS.items() if not v.startswith('goto:') or int(v.split(':')[1]) <= a.max_slide]+['[unk]'])) if a.grammar else KaldiRecognizer(model, rate)
     rec.SetWords(True)
     if a.control:
         import win32com.client
@@ -43,17 +55,18 @@ def main():
     def callback(indata, frames, timing, status):
         nonlocal overflow
         if status: overflow = True
-        try: q.put_nowait(bytes(indata))
+        try: q.put_nowait((time.monotonic(), bytes(indata)))
         except queue.Full: overflow = True
     last = float('-inf')
+    locked = False
     print(f'RUNNING | {sd.query_devices(a.device, "input")["name"]} | {rate} Hz | {"PPT CONTROL" if a.control else "DRY RUN"}', flush=True)
-    print('Say: slide next / slide back. Ctrl+C to stop.', flush=True)
+    print('Say: slide next / slide back / slide five / slide lock. Ctrl+C to stop.', flush=True)
     try:
         with sd.RawInputStream(device=a.device, samplerate=rate, channels=1, dtype='int16', blocksize=max(1,rate//20), callback=callback):
             while True:
-                try: data = q.get(timeout=1)
+                try: captured, data = q.get(timeout=1)
                 except queue.Empty: continue
-                if overflow:
+                if overflow or time.monotonic() - captured > .5:
                     overflow = False
                     rec.Reset()
                     while True:
@@ -67,6 +80,13 @@ def main():
                 action = decide(result,a.confidence,last,now,a.cooldown)
                 if a.verbose and result.get('text'): print('HEARD:',result,flush=True)
                 if not action: continue
+                if action.startswith('goto:') and int(action.split(':')[1]) > a.max_slide: continue
+                if locked and action != 'unlock': continue
+                if action in ('lock', 'unlock'):
+                    locked = action == 'lock'
+                    last = now
+                    print('LOCKED' if locked else 'UNLOCKED', flush=True)
+                    continue
                 last = now
                 if not a.control:
                     print('DETECTED:',result['text'],'->',action,flush=True); continue
@@ -76,7 +96,18 @@ def main():
                         print('SKIP: exactly one slideshow must be running',flush=True); continue
                     view = app.SlideShowWindows(1).View
                     if action == 'next': view.Next()
-                    else: view.Previous()
+                    elif action == 'back': view.Previous()
+                    elif action == 'first': view.First()
+                    elif action == 'last': view.Last()
+                    elif action == 'black': view.State = 3
+                    elif action == 'white': view.State = 4
+                    elif action == 'show': view.State = 1
+                    elif action.startswith('goto:'):
+                        n = int(action.split(':')[1])
+                        if not 1 <= n <= app.SlideShowWindows(1).Presentation.Slides.Count:
+                            print('SKIP: slide out of range', flush=True); continue
+                        view.GotoSlide(n)
+                    else: continue
                     print('EXECUTED:',result['text'],flush=True)
                 except Exception as exc: print('PPT ERROR:',exc,flush=True)
     except KeyboardInterrupt: print('\nSTOPPED')
