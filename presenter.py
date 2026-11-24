@@ -1,4 +1,5 @@
 import argparse
+import sys
 import math
 from array import array
 import json
@@ -111,7 +112,7 @@ def main():
     group.add_argument('--device', type=int)
     group.add_argument('--mic', help='Input device name substring, e.g. Realtek or JBL')
     p.add_argument('--no-fallback', action='store_true', help='Do not switch to internal microphone after JBL failure')
-    p.add_argument('--model', default=str(Path(__file__).parent / 'models' / 'vosk-model-small-en-us-0.15'))
+    p.add_argument('--model', default=str((Path(sys.executable).resolve().parent if getattr(sys, 'frozen', False) else Path(__file__).resolve().parent) / 'models' / 'vosk-model-small-en-us-0.15'))
     p.add_argument('--control', action='store_true', help='Enable PowerPoint control; default is dry run')
     p.add_argument('--grammar', action=argparse.BooleanOptionalAction, default=True, help='Constrained vocabulary (default)')
     p.add_argument('--max-slide', type=int, default=100, choices=range(1,201), metavar='1-200')
@@ -123,6 +124,8 @@ def main():
     p.add_argument('--diagnostic', action='store_true', help='Show input level and rejection reasons')
     p.add_argument('--no-timing-guard', action='store_true', help='Disable experimental duration checks for A/B tests')
     a = p.parse_args()
+    if getattr(sys, 'frozen', False) and len(sys.argv) == 1:
+        a.control = True
     if a.self_test:
         self_test(); return
     import sounddevice as sd
