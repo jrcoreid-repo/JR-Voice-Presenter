@@ -17,7 +17,7 @@ def number_words(n):
 
 COMMANDS = {'slide next': 'next', 'slide back': 'back', 'slide first': 'first',
             'slide last': 'last', 'slide black': 'black', 'slide white': 'white',
-            'slide show': 'show', 'slide lock': 'lock', 'slide unlock': 'unlock'}
+            'slide open': 'open', 'slide start': 'start', 'slide stop': 'stop', 'slide show': 'show', 'slide lock': 'lock', 'slide unlock': 'unlock'}
 COMMANDS.update({'slide ' + number_words(n): 'goto:' + str(n) for n in range(1, 201)})
 
 def decide(result, threshold, last, now, cooldown):
@@ -95,7 +95,7 @@ def wake_grammar(limit, navigation_only=False):
     tails = [k[6:] for k,v in COMMANDS.items()
              if not v.startswith('goto:') or int(v.split(':')[1]) <= limit]
     if navigation_only:
-        tails = [t for t in tails if t in ('next','back','first','last','lock','unlock','black','white','show')]
+        tails = [t for t in tails if t in ('next','back','first','last','lock','unlock','black','white','show','open','start','stop')]
     return ['[unk]', 'powerpoint', 'power point'] + tails + [
         prefix + ' ' + tail for prefix in ('powerpoint','power point') for tail in tails]
 
@@ -149,7 +149,10 @@ def self_test():
     assert feedback_text('goto:25') == 'Slide twenty five, sir.'
     assert voice_clip(Path('voice_pack'), 'next').name == 'next.mp3'
     assert voice_clip(Path('voice_pack'), 'goto:25').name == 'goto.mp3'
-    print('PASS: voice feedback mapping')
+    assert 'powerpoint open' in wake_grammar(100, True)
+    assert 'powerpoint start' in wake_grammar(100, True)
+    assert 'powerpoint stop' in wake_grammar(100, True)
+    print('PASS: voice feedback mapping and lifecycle grammar')
     print('Self-test checks synthetic results only; no audio or PowerPoint tested.')
 
 def device_candidates(sd, explicit=None, name=None, fallback=True):
@@ -187,7 +190,7 @@ def feedback_text(action):
             'first':'First slide.', 'last':'Last slide.',
             'lock':'Locked.', 'unlock':'Unlocked.',
             'black':'Screen hidden.', 'white':'White screen.',
-            'show':'Screen restored.', 'startup':'All systems operational. Welcome back, sir.'}.get(action, 'Done.')
+            'show':'Screen restored.', 'open':'Opening your presentation, sir.', 'start':'Presentation ready, sir.', 'stop':'Presentation ended, sir.', 'error':'Unable to comply, sir.', 'startup':'All systems operational. Welcome back, sir.'}.get(action, 'Done.')
 
 def voice_clip(root, action):
     key = 'goto' if action.startswith('goto:') else action
@@ -238,14 +241,47 @@ def init_sapi():
         print('WARN: voice feedback unavailable:', exc, flush=True)
         return None
 
+def open_target(client, path):
+    path = path.resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f'Presentation not found: {path}')
+    try:
+        app = client.GetActiveObject('PowerPoint.Application')
+    except Exception:
+        app = client.Dispatch('PowerPoint.Application')
+    app.Visible = True
+    for pres in app.Presentations:
+        if Path(pres.FullName).resolve() == path:
+            return app, pres
+    return app, app.Presentations.Open(str(path), WithWindow=True)
+
+def run_lifecycle(client, path, action):
+    if action in ('open', 'start'):
+        app, pres = open_target(client, path)
+        if action == 'start':
+            for window in app.SlideShowWindows:
+                if Path(window.Presentation.FullName).resolve() == path.resolve():
+                    return
+            if app.SlideShowWindows.Count:
+                raise RuntimeError('Another slideshow is running; stop it first')
+            pres.SlideShowSettings.Run()
+        return
+    app = client.GetActiveObject('PowerPoint.Application')
+    for window in app.SlideShowWindows:
+        if Path(window.Presentation.FullName).resolve() == path.resolve():
+            window.View.Exit()
+            return
+    raise RuntimeError('Configured presentation is not running')
+
 def main():
-    p = argparse.ArgumentParser(description='JR Voice Presenter v0.6.4 experimental')
+    p = argparse.ArgumentParser(description='JR Voice Presenter v0.6.5 experimental')
     p.add_argument('--list-devices', action='store_true')
     group = p.add_mutually_exclusive_group()
     group.add_argument('--device', type=int)
     group.add_argument('--mic', help='Input device name substring, e.g. Realtek or JBL')
     p.add_argument('--no-fallback', action='store_true', help='Do not switch to internal microphone after JBL failure')
     p.add_argument('--model', default=str((Path(sys.executable).resolve().parent if getattr(sys, 'frozen', False) else Path(__file__).resolve().parent) / 'models' / 'vosk-model-small-en-us-0.15'))
+    p.add_argument('--ppt', type=Path, default=(Path(sys.executable).resolve().parent if getattr(sys, 'frozen', False) else Path(__file__).resolve().parent) / 'presentation.pptx', help='Fixed presentation file')
     p.add_argument('--control', action='store_true', help='Enable PowerPoint control; default is dry run')
     p.add_argument('--grammar', action=argparse.BooleanOptionalAction, default=True, help='Constrained vocabulary (default)')
     p.add_argument('--max-slide', type=int, default=100, choices=range(1,201), metavar='1-200')
@@ -403,7 +439,7 @@ def main():
                                     armed_until = 0.0
                                 else:
                                     # Do not execute number prefixes (five vs fifty, twenty vs twenty five).
-                                    if result is None or COMMANDS[result['text']].startswith('goto:'):
+                                    if result is None or COMMANDS[result['text']].startswith('goto:') or COMMANDS[result['text']] in ('open','start','stop'):
                                         pending = None
                                         continue
                                     key = result['text']
@@ -450,6 +486,11 @@ def main():
                                 speak_feedback(action)
                                 continue
                             try:
+                                if action in ('open','start','stop'):
+                                    run_lifecycle(win32com.client, a.ppt, action)
+                                    print('EXECUTED:', action, '|', a.ppt, flush=True)
+                                    speak_feedback(action)
+                                    continue
                                 app = win32com.client.GetActiveObject('PowerPoint.Application')
                                 if app.SlideShowWindows.Count != 1:
                                     print('SKIP: exactly one slideshow must be running',flush=True); continue
